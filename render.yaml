@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: haiyan-xhs-reader
+    runtime: docker
+    plan: free
+    autoDeploy: false
+    healthCheckPath: /health
