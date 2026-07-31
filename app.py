@@ -17,7 +17,9 @@ from urllib.parse import urljoin, urlparse
 import httpx
 from bs4 import BeautifulSoup
 from fastmcp import FastMCP
+from fastmcp.tools.tool import ToolResult
 from fastmcp.utilities.types import Image
+from mcp.types import TextContent
 from PIL import Image as PILImage
 from starlette.applications import Starlette
 from starlette.responses import JSONResponse, PlainTextResponse
@@ -533,22 +535,63 @@ def metadata(note: dict[str, Any], media_kind: str) -> str:
     )
 
 
-def jpeg_bytes(data: bytes, max_edge: int = 1280) -> bytes:
+def jpeg_bytes_with_info(
+    data: bytes, max_edge: int = 1280
+) -> tuple[bytes, dict[str, Any]]:
+    """Convert an image to JPEG and report dimensions for diagnostics."""
     with PILImage.open(io.BytesIO(data)) as image:
+        source_format = image.format or "unknown"
+        source_width, source_height = image.size
         image = image.convert("RGB")
         image.thumbnail((max_edge, max_edge), PILImage.Resampling.LANCZOS)
+        output_width, output_height = image.size
         output = io.BytesIO()
         image.save(output, format="JPEG", quality=82, optimize=True)
-        return output.getvalue()
+        jpeg = output.getvalue()
+    return jpeg, {
+        "source_format": source_format,
+        "source_width": source_width,
+        "source_height": source_height,
+        "output_width": output_width,
+        "output_height": output_height,
+    }
 
 
-async def download_image(url: str) -> bytes:
-    raw, _, _ = await fetch_bytes(url, media=True, max_bytes=MAX_IMAGE)
+async def download_image_with_diagnostics(
+    url: str,
+) -> tuple[bytes, dict[str, Any]]:
+    """Download one image and return both the JPEG bytes and transport facts."""
+    raw, resolved_url, content_type = await fetch_bytes(
+        url, media=True, max_bytes=MAX_IMAGE
+    )
     try:
-        return await asyncio.to_thread(jpeg_bytes, raw)
+        jpeg, details = await asyncio.to_thread(jpeg_bytes_with_info, raw)
     except Exception as exc:
         raise XHSError(f"Image decode failed: {exc}") from exc
+    details.update(
+        {
+            "request_url": url,
+            "resolved_url": resolved_url,
+            "content_type": content_type or "unknown",
+            "downloaded_bytes": len(raw),
+            "jpeg_bytes": len(jpeg),
+            "inline_mime_type": "image/jpeg",
+            "inline_block_type": "image",
+        }
+    )
+    return jpeg, details
 
+
+def text_block(text: str) -> TextContent:
+    return TextContent(type="text", text=text)
+
+
+def human_bytes(value: int) -> str:
+    if value < 1024:
+        return f"{value} B"
+    if value < 1024 * 1024:
+        return f"{value / 1024:.1f} KiB"
+    return f"{value / (1024 * 1024):.2f} MiB"
 
 def run_command(args: list[str], timeout: int) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
@@ -619,43 +662,135 @@ async def xhs_peek(
     video_frames: int | None = None,
     image_start: int = 1,
     image_count: int = 8,
-) -> list[Any]:
+) -> ToolResult:
     """
     Read one public Xiaohongshu post and return its text and media.
 
-    `url` may be a bare http/https link or the entire copied share message.
-    Image posts are paginated in original order: request 1-8 images per call with
-    `image_start` and call again when the result says more images remain.
+    Version 2.2 uses an explicit MCP ToolResult. In inline mode the same call
+    returns: image URLs, per-image download diagnostics, and standard
+    ImageContent blocks in original order.
     """
     try:
         note = await read_note(url)
+        base_structured: dict[str, Any] = {
+            "reader_version": "2.2",
+            "title": note.get("title"),
+            "author": note.get("author"),
+            "description": note.get("description"),
+            "interactions": {
+                "likes": note.get("likes"),
+                "collects": note.get("collects"),
+                "comments": note.get("comments"),
+                "shares": note.get("shares"),
+            },
+            "source_url": note.get("source_url"),
+            "requested_image_mode": image_mode,
+        }
+
         if note.get("video_url"):
+            video = str(note["video_url"])
+            base_structured.update(
+                {
+                    "media_type": "video",
+                    "video_url": video,
+                }
+            )
             if image_mode == "url":
-                return [metadata(note, "video"), "Video URL:\n" + note["video_url"]]
-            frames = await extract_frames(note["video_url"], video_frames)
-            output: list[Any] = [
-                metadata(
-                    note,
-                    f"video storyboard with {len(frames)} chronological sampled frames",
+                content = [
+                    text_block(metadata(note, "video; URL mode")),
+                    text_block(
+                        "XHS Reader 2.2 diagnostics\n"
+                        f"Video URL: {video}\n"
+                        "No inline frames were requested because image_mode=url."
+                    ),
+                ]
+                return ToolResult(
+                    content=content,
+                    structured_content=base_structured,
+                    meta={"reader_version": "2.2", "inline_blocks": 0},
                 )
+
+            frames = await extract_frames(video, video_frames)
+            content: list[Any] = [
+                text_block(
+                    metadata(
+                        note,
+                        f"video storyboard with {len(frames)} chronological sampled frames",
+                    )
+                ),
+                text_block(
+                    "XHS Reader 2.2 diagnostics\n"
+                    f"Video URL: {video}\n"
+                    f"Frames extracted: {len(frames)}\n"
+                    "Each frame is followed by one explicit MCP ImageContent block. "
+                    "The client, not the server, decides whether that block becomes "
+                    "visible to the model."
+                ),
             ]
+            frame_diagnostics: list[dict[str, Any]] = []
             for index, frame in enumerate(frames, 1):
-                output.append(f"Video frame {index} of {len(frames)}:")
-                output.append(Image(data=frame, format="jpeg"))
-            return output
+                try:
+                    with PILImage.open(io.BytesIO(frame)) as image:
+                        width, height = image.size
+                except Exception:
+                    width, height = 0, 0
+                diag = {
+                    "frame": index,
+                    "jpeg_bytes": len(frame),
+                    "width": width,
+                    "height": height,
+                    "inline_block_type": "image",
+                    "inline_mime_type": "image/jpeg",
+                }
+                frame_diagnostics.append(diag)
+                content.append(
+                    text_block(
+                        f"Video frame {index} of {len(frames)}: "
+                        f"JPEG {width}x{height}, {human_bytes(len(frame))}. "
+                        "The ImageContent block follows immediately."
+                    )
+                )
+                content.append(Image(data=frame, format="jpeg").to_image_content())
+            base_structured["frames"] = frame_diagnostics
+            return ToolResult(
+                content=content,
+                structured_content=base_structured,
+                meta={
+                    "reader_version": "2.2",
+                    "inline_blocks": len(frames),
+                    "media_type": "video",
+                },
+            )
 
         image_urls = list(note.get("image_urls") or [])
         total = len(image_urls)
+        base_structured.update(
+            {
+                "media_type": "images" if total else "none",
+                "image_total": total,
+            }
+        )
         if not total:
-            return [metadata(note, "no downloadable media found")]
+            return ToolResult(
+                content=[text_block(metadata(note, "no downloadable media found"))],
+                structured_content=base_structured,
+                meta={"reader_version": "2.2", "inline_blocks": 0},
+            )
 
         start_number = max(1, int(image_start))
         count = max(1, min(8, int(image_count)))
         if start_number > total:
-            return [
-                metadata(note, f"{total} image(s)"),
-                f"image_start={start_number} is past the final image ({total}).",
-            ]
+            message = f"image_start={start_number} is past the final image ({total})."
+            base_structured["error"] = message
+            return ToolResult(
+                content=[
+                    text_block(metadata(note, f"{total} image(s)")),
+                    text_block(message),
+                ],
+                structured_content=base_structured,
+                meta={"reader_version": "2.2", "inline_blocks": 0},
+            )
+
         first_index = start_number - 1
         selected = image_urls[first_index : first_index + count]
         last_number = first_index + len(selected)
@@ -663,42 +798,158 @@ async def xhs_peek(
             f"{total} image(s) total; returning images {start_number}-{last_number} "
             "in original post order"
         )
+        base_structured.update(
+            {
+                "image_start": start_number,
+                "image_end": last_number,
+                "image_urls": selected,
+            }
+        )
 
+        url_lines = [
+            f"Image {start_number + offset}: {url_item}"
+            for offset, url_item in enumerate(selected)
+        ]
+        content: list[Any] = [
+            text_block(metadata(note, media_label)),
+            text_block(
+                "XHS Reader 2.2 diagnostics\n"
+                "The server is returning the HTTPS URLs and transport facts in text. "
+                "In inline mode it also places one explicit MCP ImageContent block "
+                "immediately after each successful image diagnostic.\n"
+                + "\n".join(url_lines)
+            ),
+        ]
+
+        diagnostics: list[dict[str, Any]] = []
+        inline_blocks = 0
         if image_mode == "url":
-            output = [
-                metadata(note, media_label),
-                "Image URLs:\n" + "\n".join(selected),
-            ]
+            for offset, url_item in enumerate(selected):
+                diagnostics.append(
+                    {
+                        "image": start_number + offset,
+                        "request_url": url_item,
+                        "download_attempted": False,
+                        "inline_block_returned": False,
+                    }
+                )
+            content.append(
+                text_block(
+                    "URL mode selected: downloads and inline ImageContent blocks were "
+                    "not attempted."
+                )
+            )
         else:
-            output = [metadata(note, media_label)]
             for offset, url_item in enumerate(selected):
                 absolute_number = start_number + offset
                 try:
-                    data = await download_image(url_item)
-                    output.append(f"Image {absolute_number} of {total}:")
-                    output.append(Image(data=data, format="jpeg"))
+                    data, diag = await download_image_with_diagnostics(url_item)
+                    diag.update(
+                        {
+                            "image": absolute_number,
+                            "download_attempted": True,
+                            "download_ok": True,
+                            "inline_block_returned": True,
+                        }
+                    )
+                    diagnostics.append(diag)
+                    content.append(
+                        text_block(
+                            f"Image {absolute_number} of {total}: DOWNLOAD_OK; "
+                            f"source={diag['source_format']} "
+                            f"{diag['source_width']}x{diag['source_height']}; "
+                            f"download={human_bytes(diag['downloaded_bytes'])}; "
+                            f"JPEG={diag['output_width']}x{diag['output_height']} "
+                            f"{human_bytes(diag['jpeg_bytes'])}; "
+                            f"content-type={diag['content_type']}; "
+                            f"resolved URL={diag['resolved_url']}; "
+                            "one explicit image/jpeg ImageContent block follows now."
+                        )
+                    )
+                    content.append(Image(data=data, format="jpeg").to_image_content())
+                    inline_blocks += 1
                 except XHSError as exc:
-                    output.append(
-                        f"Image {absolute_number} of {total} could not be downloaded: {exc}"
+                    diagnostics.append(
+                        {
+                            "image": absolute_number,
+                            "request_url": url_item,
+                            "download_attempted": True,
+                            "download_ok": False,
+                            "inline_block_returned": False,
+                            "error": str(exc),
+                        }
+                    )
+                    content.append(
+                        text_block(
+                            f"Image {absolute_number} of {total}: DOWNLOAD_FAILED; "
+                            f"URL={url_item}; error={exc}"
+                        )
                     )
 
+        base_structured["image_diagnostics"] = diagnostics
+        base_structured["inline_blocks_returned"] = inline_blocks
         if last_number < total:
-            output.append(
+            continuation = (
                 f"More images remain. Call xhs_peek again with "
                 f"image_start={last_number + 1} and image_count={count}."
             )
         else:
-            output.append(f"All {total} images have now been returned in order.")
-        return output
+            continuation = f"All {total} images have now been returned in order."
+        content.append(text_block(continuation))
+        content.append(
+            text_block(
+                "Verification rule: DOWNLOAD_OK and inline_block_returned=true prove "
+                "the Render/MCP server produced the image block. They do not prove the "
+                "ChatGPT client exposed its pixels to the model; visual confirmation "
+                "still requires describing details that are not present in the text."
+            )
+        )
+        return ToolResult(
+            content=content,
+            structured_content=base_structured,
+            meta={
+                "reader_version": "2.2",
+                "media_type": "images",
+                "inline_blocks": inline_blocks,
+                "selected_images": len(selected),
+            },
+        )
     except httpx.HTTPStatusError as exc:
-        return [
+        message = (
             f"Xiaohongshu returned HTTP {exc.response.status_code}. The post may be "
             "unavailable, private, expired, or temporarily rate-limited."
-        ]
+        )
+        return ToolResult(
+            content=[text_block(message)],
+            structured_content={
+                "reader_version": "2.2",
+                "ok": False,
+                "error": message,
+            },
+            meta={"reader_version": "2.2", "inline_blocks": 0},
+        )
     except (XHSError, ValueError) as exc:
-        return [f"Could not read this Xiaohongshu post: {exc}"]
+        message = f"Could not read this Xiaohongshu post: {exc}"
+        return ToolResult(
+            content=[text_block(message)],
+            structured_content={
+                "reader_version": "2.2",
+                "ok": False,
+                "error": message,
+            },
+            meta={"reader_version": "2.2", "inline_blocks": 0},
+        )
     except Exception as exc:
-        return [f"Unexpected reader error: {type(exc).__name__}: {exc}"]
+        message = f"Unexpected reader error: {type(exc).__name__}: {exc}"
+        return ToolResult(
+            content=[text_block(message)],
+            structured_content={
+                "reader_version": "2.2",
+                "ok": False,
+                "error": message,
+            },
+            meta={"reader_version": "2.2", "inline_blocks": 0},
+        )
 
 
 async def homepage(request):
@@ -714,7 +965,8 @@ async def health(request):
             "service": APP_NAME,
             "ffmpeg": bool(shutil.which("ffmpeg")),
             "ffprobe": bool(shutil.which("ffprobe")),
-            "version": "2.0",
+            "version": "2.2",
+            "image_return": "explicit ToolResult + ImageContent + diagnostics",
         }
     )
 
