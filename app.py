@@ -641,7 +641,7 @@ async def xhs_peek(
             ]
             for index, frame in enumerate(frames, 1):
                 output.append(f"Video frame {index} of {len(frames)}:")
-                output.append(Image(data=frame, format="jpeg").to_image_content())
+                output.append(Image(data=frame, format="jpeg"))
             return output
 
         image_urls = list(note.get("image_urls") or [])
@@ -676,7 +676,7 @@ async def xhs_peek(
                 try:
                     data = await download_image(url_item)
                     output.append(f"Image {absolute_number} of {total}:")
-                    output.append(Image(data=data, format="jpeg").to_image_content())
+                    output.append(Image(data=data, format="jpeg"))
                 except XHSError as exc:
                     output.append(
                         f"Image {absolute_number} of {total} could not be downloaded: {exc}"
@@ -714,7 +714,7 @@ async def health(request):
             "service": APP_NAME,
             "ffmpeg": bool(shutil.which("ffmpeg")),
             "ffprobe": bool(shutil.which("ffprobe")),
-            "version": "2.1",
+            "version": "2.0",
         }
     )
 
