@@ -4,6 +4,7 @@ import asyncio
 import io
 import json
 import html as html_lib
+import logging
 import re
 import shutil
 import socket
@@ -39,6 +40,12 @@ MAX_IMAGE = 15 * 1024 * 1024
 MAX_VIDEO = 200 * 1024 * 1024
 CACHE_TTL = 6 * 60 * 60
 REQUEST_GAP = 1.2
+VIDEO_CHUNK_SIZE = 256 * 1024
+VIDEO_RETRY_DELAYS = (0.5, 1.0, 2.0)
+VIDEO_TRANSIENT_STATUSES = {408, 425, 429, 500, 502, 503, 504}
+VIDEO_PATCH_REVISION = "2.2-video-retry-r1"
+
+logger = logging.getLogger("xhs_reader")
 
 mcp = FastMCP(
     APP_NAME,
@@ -58,6 +65,36 @@ _last_request = 0.0
 
 class XHSError(RuntimeError):
     pass
+
+
+class VideoStageError(XHSError):
+    """Video-only failure that preserves structured diagnostics for graceful fallback."""
+
+    def __init__(
+        self,
+        stage: str,
+        message: str,
+        *,
+        error_type: str = "VideoStageError",
+        diagnostics: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.stage = stage
+        self.error_type = error_type
+        self.diagnostics = diagnostics or {}
+
+
+class RetryableVideoDownloadError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_type: str,
+        restart_full: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.error_type = error_type
+        self.restart_full = restart_full
 
 
 def hostname(url: str) -> str:
@@ -599,12 +636,390 @@ def run_command(args: list[str], timeout: int) -> subprocess.CompletedProcess[st
     )
 
 
-async def extract_frames(video: str, requested: int | None) -> list[bytes]:
-    raw, _, _ = await fetch_bytes(video, media=True, max_bytes=MAX_VIDEO)
+def _parse_content_range(value: str | None) -> tuple[int | None, int | None, int | None]:
+    if not value:
+        return None, None, None
+    match = re.fullmatch(r"bytes\s+(\d+)-(\d+)/(\d+|\*)", value.strip(), re.I)
+    if not match:
+        return None, None, None
+    start = int(match.group(1))
+    end = int(match.group(2))
+    total = None if match.group(3) == "*" else int(match.group(3))
+    return start, end, total
+
+
+def _parse_unsatisfied_range_total(value: str | None) -> int | None:
+    if not value:
+        return None
+    match = re.fullmatch(r"bytes\s+\*/(\d+)", value.strip(), re.I)
+    return int(match.group(1)) if match else None
+
+
+def _content_length(headers: httpx.Headers) -> int | None:
+    value = headers.get("content-length")
+    if value and value.isdigit():
+        return int(value)
+    return None
+
+
+def _safe_video_error(exc: BaseException) -> tuple[str, str]:
+    if isinstance(exc, RetryableVideoDownloadError):
+        return exc.error_type, str(exc)
+    if isinstance(exc, httpx.RemoteProtocolError):
+        return type(exc).__name__, "peer closed the video connection before transfer completed"
+    if isinstance(exc, httpx.ReadTimeout):
+        return type(exc).__name__, "video read timed out"
+    if isinstance(exc, httpx.ConnectTimeout):
+        return type(exc).__name__, "video connection timed out"
+    if isinstance(exc, httpx.ReadError):
+        return type(exc).__name__, "video read failed"
+    if isinstance(exc, httpx.ConnectError):
+        return type(exc).__name__, "video connection failed"
+    if isinstance(exc, httpx.PoolTimeout):
+        return type(exc).__name__, "video connection pool timed out"
+    if isinstance(exc, httpx.HTTPStatusError):
+        return type(exc).__name__, f"video server returned HTTP {exc.response.status_code}"
+    return type(exc).__name__, str(exc)[:240]
+
+
+def _video_attempt_summary(
+    *,
+    attempt: int,
+    range_requested: bool,
+    resume_from: int,
+) -> dict[str, Any]:
+    return {
+        "attempt": attempt,
+        "range_requested": range_requested,
+        "resume_from": resume_from,
+    }
+
+
+async def download_video_to_path(
+    video: str, video_path: Path, *, max_bytes: int = MAX_VIDEO
+) -> dict[str, Any]:
+    """Stream a video to disk with bounded retry, Range resume, and full-restart fallback."""
+    current = validate_url(video, media=True)
+    base_headers = {
+        "User-Agent": MOBILE_UA,
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.6",
+        "Accept": "*/*",
+        "Accept-Encoding": "identity",
+    }
+    timeout = httpx.Timeout(connect=15, read=60, write=30, pool=15)
+    diagnostics: dict[str, Any] = {
+        "status": "downloading",
+        "patch_revision": VIDEO_PATCH_REVISION,
+        "max_retries": len(VIDEO_RETRY_DELAYS),
+        "attempts": [],
+        "range_resume_used": False,
+        "range_fallback_to_full": False,
+        "expected_bytes": None,
+        "downloaded_bytes": 0,
+    }
+    disable_range_once = False
+
+    retryable_transport = (
+        httpx.RemoteProtocolError,
+        httpx.ReadError,
+        httpx.ReadTimeout,
+        httpx.ConnectTimeout,
+        httpx.ConnectError,
+        httpx.PoolTimeout,
+    )
+
+    async with httpx.AsyncClient(
+        timeout=timeout, follow_redirects=False, headers=base_headers
+    ) as client:
+        total_attempts = len(VIDEO_RETRY_DELAYS) + 1
+        for attempt_number in range(1, total_attempts + 1):
+            existing = video_path.stat().st_size if video_path.exists() else 0
+            if existing > max_bytes:
+                raise VideoStageError(
+                    "video_download",
+                    f"Partial video exceeded {max_bytes // (1024 * 1024)} MB.",
+                    error_type="VideoTooLarge",
+                    diagnostics=diagnostics,
+                )
+
+            use_range = existing > 0 and not disable_range_once
+            disable_range_once = False
+            request_headers: dict[str, str] = {}
+            if use_range:
+                request_headers["Range"] = f"bytes={existing}-"
+
+            attempt_diag = _video_attempt_summary(
+                attempt=attempt_number,
+                range_requested=use_range,
+                resume_from=existing if use_range else 0,
+            )
+            diagnostics["attempts"].append(attempt_diag)
+
+            try:
+                redirects = 0
+                while True:
+                    if redirects > MAX_REDIRECTS:
+                        raise VideoStageError(
+                            "video_request",
+                            "Too many redirects while downloading the video.",
+                            error_type="TooManyRedirects",
+                            diagnostics=diagnostics,
+                        )
+                    await rate_limit()
+                    async with client.stream(
+                        "GET", current, headers=request_headers
+                    ) as response:
+                        if response.status_code in {301, 302, 303, 307, 308}:
+                            location = response.headers.get("location")
+                            if not location:
+                                raise VideoStageError(
+                                    "video_request",
+                                    "Video redirect had no destination.",
+                                    error_type="RedirectMissingLocation",
+                                    diagnostics=diagnostics,
+                                )
+                            current = validate_url(
+                                urljoin(current, location), media=True
+                            )
+                            redirects += 1
+                            continue
+
+                        status = response.status_code
+                        attempt_diag["http_status"] = status
+                        attempt_diag["accept_ranges"] = response.headers.get(
+                            "accept-ranges", ""
+                        )
+
+                        if status in VIDEO_TRANSIENT_STATUSES or 500 <= status <= 599:
+                            raise RetryableVideoDownloadError(
+                                f"temporary HTTP {status} from video CDN",
+                                error_type=f"HTTP{status}",
+                            )
+
+                        if use_range and status == 416:
+                            known_total = _parse_unsatisfied_range_total(
+                                response.headers.get("content-range")
+                            )
+                            if known_total is not None and existing == known_total:
+                                diagnostics.update(
+                                    {
+                                        "status": "complete",
+                                        "downloaded_bytes": existing,
+                                        "expected_bytes": known_total,
+                                        "resolved_url": str(response.url),
+                                        "content_type": response.headers.get(
+                                            "content-type", ""
+                                        ),
+                                    }
+                                )
+                                attempt_diag["result"] = "already_complete"
+                                return diagnostics
+                            if video_path.exists():
+                                video_path.unlink()
+                            diagnostics["range_fallback_to_full"] = True
+                            raise RetryableVideoDownloadError(
+                                "Range request was rejected; retrying from byte zero",
+                                error_type="RangeNotSatisfiable",
+                                restart_full=True,
+                            )
+
+                        if use_range and status == 206:
+                            range_start, _, range_total = _parse_content_range(
+                                response.headers.get("content-range")
+                            )
+                            if range_start is None or range_start != existing:
+                                if video_path.exists():
+                                    video_path.unlink()
+                                diagnostics["range_fallback_to_full"] = True
+                                raise RetryableVideoDownloadError(
+                                    "CDN returned an invalid Content-Range; restarting fully",
+                                    error_type="InvalidContentRange",
+                                    restart_full=True,
+                                )
+                            mode = "ab"
+                            base_size = existing
+                            diagnostics["range_resume_used"] = True
+                            attempt_diag["range_accepted"] = True
+                            expected_total = range_total
+                            if expected_total is None:
+                                remaining = _content_length(response.headers)
+                                expected_total = (
+                                    existing + remaining if remaining is not None else None
+                                )
+                        elif use_range and status == 200:
+                            # The server ignored Range. Safely discard the partial file and
+                            # use this 200 response as a full restart without another request.
+                            mode = "wb"
+                            base_size = 0
+                            diagnostics["range_fallback_to_full"] = True
+                            attempt_diag["range_accepted"] = False
+                            expected_total = _content_length(response.headers)
+                        else:
+                            response.raise_for_status()
+                            if status == 206:
+                                range_start, _, range_total = _parse_content_range(
+                                    response.headers.get("content-range")
+                                )
+                                if range_start not in {None, 0}:
+                                    raise RetryableVideoDownloadError(
+                                        "Unexpected partial response did not start at byte zero",
+                                        error_type="UnexpectedPartialResponse",
+                                        restart_full=True,
+                                    )
+                                expected_total = range_total
+                            else:
+                                expected_total = _content_length(response.headers)
+                            mode = "wb"
+                            base_size = 0
+
+                        if expected_total is not None and expected_total > max_bytes:
+                            raise VideoStageError(
+                                "video_download",
+                                f"Video exceeds {max_bytes // (1024 * 1024)} MB limit.",
+                                error_type="VideoTooLarge",
+                                diagnostics=diagnostics,
+                            )
+
+                        bytes_written = base_size
+                        with video_path.open(mode) as handle:
+                            async for chunk in response.aiter_raw(
+                                chunk_size=VIDEO_CHUNK_SIZE
+                            ):
+                                if not chunk:
+                                    continue
+                                bytes_written += len(chunk)
+                                if bytes_written > max_bytes:
+                                    raise VideoStageError(
+                                        "video_download",
+                                        f"Video exceeds {max_bytes // (1024 * 1024)} MB limit.",
+                                        error_type="VideoTooLarge",
+                                        diagnostics=diagnostics,
+                                    )
+                                handle.write(chunk)
+
+                        final_size = video_path.stat().st_size
+                        attempt_diag["downloaded_bytes_after_attempt"] = final_size
+                        attempt_diag["expected_bytes"] = expected_total
+                        diagnostics["downloaded_bytes"] = final_size
+                        diagnostics["expected_bytes"] = expected_total
+
+                        if expected_total is not None and final_size < expected_total:
+                            raise RetryableVideoDownloadError(
+                                f"video download incomplete ({final_size}/{expected_total} bytes)",
+                                error_type="IncompleteDownload",
+                            )
+                        if expected_total is not None and final_size > expected_total:
+                            raise VideoStageError(
+                                "video_download",
+                                "Video download exceeded the declared final size.",
+                                error_type="DownloadSizeMismatch",
+                                diagnostics=diagnostics,
+                            )
+
+                        attempt_diag["result"] = "complete"
+                        diagnostics.update(
+                            {
+                                "status": "complete",
+                                "downloaded_bytes": final_size,
+                                "resolved_url": str(response.url),
+                                "content_type": response.headers.get(
+                                    "content-type", ""
+                                ),
+                            }
+                        )
+                        return diagnostics
+
+            except VideoStageError:
+                raise
+            except retryable_transport as exc:
+                error_type, message = _safe_video_error(exc)
+                retry_error = RetryableVideoDownloadError(
+                    message, error_type=error_type
+                )
+            except RetryableVideoDownloadError as exc:
+                retry_error = exc
+            except httpx.HTTPStatusError as exc:
+                error_type, message = _safe_video_error(exc)
+                diagnostics.update(
+                    {
+                        "status": "failed",
+                        "error_type": error_type,
+                        "error_message": message,
+                        "downloaded_bytes": video_path.stat().st_size
+                        if video_path.exists()
+                        else 0,
+                    }
+                )
+                raise VideoStageError(
+                    "video_request",
+                    message,
+                    error_type=error_type,
+                    diagnostics=diagnostics,
+                ) from exc
+
+            partial_size = video_path.stat().st_size if video_path.exists() else 0
+            attempt_diag.update(
+                {
+                    "result": "retry",
+                    "error_type": retry_error.error_type,
+                    "error_message": str(retry_error),
+                    "downloaded_bytes_after_attempt": partial_size,
+                }
+            )
+            diagnostics["downloaded_bytes"] = partial_size
+            logger.warning(
+                "video_download_retry host=%s attempt=%d/%d type=%s bytes=%d",
+                hostname(current),
+                attempt_number,
+                total_attempts,
+                retry_error.error_type,
+                partial_size,
+            )
+
+            if retry_error.restart_full:
+                if video_path.exists():
+                    video_path.unlink()
+                disable_range_once = True
+
+            if attempt_number >= total_attempts:
+                diagnostics.update(
+                    {
+                        "status": "failed",
+                        "error_type": retry_error.error_type,
+                        "error_message": str(retry_error),
+                    }
+                )
+                raise VideoStageError(
+                    "video_download",
+                    str(retry_error),
+                    error_type=retry_error.error_type,
+                    diagnostics=diagnostics,
+                ) from retry_error
+
+            delay = VIDEO_RETRY_DELAYS[attempt_number - 1]
+            attempt_diag["retry_after_seconds"] = delay
+            await asyncio.sleep(delay)
+
+    raise VideoStageError(
+        "video_download",
+        "Video download ended without a result.",
+        error_type="VideoDownloadUnknown",
+        diagnostics=diagnostics,
+    )
+
+
+async def extract_frames(
+    video: str, requested: int | None
+) -> tuple[list[bytes], dict[str, Any]]:
     with tempfile.TemporaryDirectory(prefix="xhs-video-") as temp:
         folder = Path(temp)
         video_path = folder / "video.mp4"
-        video_path.write_bytes(raw)
+        download_diag = await download_video_to_path(video, video_path, max_bytes=MAX_VIDEO)
+        processing_diag: dict[str, Any] = {
+            "status": "downloaded",
+            "download": download_diag,
+            "requested_frames": requested,
+        }
         try:
             probe = await asyncio.to_thread(
                 run_command,
@@ -621,11 +1036,29 @@ async def extract_frames(video: str, requested: int | None) -> list[bytes]:
                 30,
             )
             duration = max(0.1, float(probe.stdout.strip()))
+            processing_diag["duration_seconds"] = duration
         except Exception as exc:
-            raise XHSError(f"ffprobe could not read the video: {exc}") from exc
-        count = max(4, min(8, int(requested))) if requested else max(
-            4, min(8, round(duration / 8))
+            processing_diag.update(
+                {
+                    "status": "failed",
+                    "stage": "ffprobe",
+                    "error_type": type(exc).__name__,
+                    "error_message": "ffprobe could not read the downloaded video",
+                }
+            )
+            raise VideoStageError(
+                "ffprobe",
+                "ffprobe could not read the downloaded video.",
+                error_type=type(exc).__name__,
+                diagnostics=processing_diag,
+            ) from exc
+
+        count = (
+            max(1, min(8, int(requested)))
+            if requested is not None
+            else max(4, min(8, round(duration / 8)))
         )
+        processing_diag["target_frames"] = count
         pattern = str(folder / "frame-%02d.jpg")
         try:
             await asyncio.to_thread(
@@ -648,11 +1081,46 @@ async def extract_frames(video: str, requested: int | None) -> list[bytes]:
                 150,
             )
         except Exception as exc:
-            raise XHSError(f"ffmpeg could not extract frames: {exc}") from exc
+            processing_diag.update(
+                {
+                    "status": "failed",
+                    "stage": "ffmpeg",
+                    "error_type": type(exc).__name__,
+                    "error_message": "ffmpeg could not extract video frames",
+                }
+            )
+            raise VideoStageError(
+                "ffmpeg",
+                "ffmpeg could not extract video frames.",
+                error_type=type(exc).__name__,
+                diagnostics=processing_diag,
+            ) from exc
+
         frames = [path.read_bytes() for path in sorted(folder.glob("frame-*.jpg"))]
         if not frames:
-            raise XHSError("No video frames were extracted.")
-        return frames[:8]
+            processing_diag.update(
+                {
+                    "status": "failed",
+                    "stage": "ffmpeg",
+                    "error_type": "NoFramesExtracted",
+                    "error_message": "No video frames were extracted",
+                }
+            )
+            raise VideoStageError(
+                "ffmpeg",
+                "No video frames were extracted.",
+                error_type="NoFramesExtracted",
+                diagnostics=processing_diag,
+            )
+        frames = frames[:count]
+        processing_diag.update(
+            {
+                "status": "complete",
+                "stage": "complete",
+                "frames_extracted": len(frames),
+            }
+        )
+        return frames, processing_diag
 
 
 @mcp.tool
@@ -710,7 +1178,44 @@ async def xhs_peek(
                     meta={"reader_version": "2.2", "inline_blocks": 0},
                 )
 
-            frames = await extract_frames(video, video_frames)
+            try:
+                frames, video_processing = await extract_frames(video, video_frames)
+            except VideoStageError as exc:
+                failure_diag = dict(exc.diagnostics)
+                failure_diag.update(
+                    {
+                        "status": "failed",
+                        "stage": exc.stage,
+                        "error_type": exc.error_type,
+                        "error_message": str(exc),
+                        "frames_extracted": 0,
+                    }
+                )
+                base_structured["video_processing"] = failure_diag
+                content = [
+                    text_block(metadata(note, "video metadata parsed; frame extraction unavailable")),
+                    text_block(
+                        "XHS Reader 2.2 diagnostics\n"
+                        f"Video URL: {video}\n"
+                        "Video metadata: PARSED_OK\n"
+                        f"Video processing: FAILED at {exc.stage}\n"
+                        f"Error: {exc.error_type}: {str(exc)}\n"
+                        "The note metadata and video_url are still returned; no inline "
+                        "video frames were produced."
+                    ),
+                ]
+                return ToolResult(
+                    content=content,
+                    structured_content=base_structured,
+                    meta={
+                        "reader_version": "2.2",
+                        "inline_blocks": 0,
+                        "media_type": "video",
+                        "video_processing": "failed",
+                    },
+                )
+
+            base_structured["video_processing"] = video_processing
             content: list[Any] = [
                 text_block(
                     metadata(
@@ -721,6 +1226,8 @@ async def xhs_peek(
                 text_block(
                     "XHS Reader 2.2 diagnostics\n"
                     f"Video URL: {video}\n"
+                    "Video metadata: PARSED_OK\n"
+                    f"Video download: {str(video_processing.get('download', {}).get('status', 'unknown')).upper()}\n"
                     f"Frames extracted: {len(frames)}\n"
                     "Each frame is followed by one explicit MCP ImageContent block. "
                     "The client, not the server, decides whether that block becomes "
@@ -966,6 +1473,7 @@ async def health(request):
             "ffmpeg": bool(shutil.which("ffmpeg")),
             "ffprobe": bool(shutil.which("ffprobe")),
             "version": "2.2",
+            "video_patch_revision": VIDEO_PATCH_REVISION,
             "image_return": "explicit ToolResult + ImageContent + diagnostics",
         }
     )
